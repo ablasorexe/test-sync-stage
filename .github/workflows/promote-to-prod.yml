@@ -1,0 +1,89 @@
+name: Promote to Prod (cherry-pick)
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.chk.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with: 
+          fetch-depth: 0
+
+      - id: chk
+        run: |
+          # Skip if the actor is the bot (prevents loops)
+          if [ "${{ github.actor }}" = "repo-bot" ]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Skip if last commit contains a promo marker (prevents loops)
+          msg="$(git log -1 --pretty=%B)"
+          if echo "$msg" | grep -qE '\[promo [sp]->[ps]:'; then
+            echo "Commit is a promo; skipping."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
+  promote:
+    if: needs.guard.outputs.should_run == 'true'
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: 
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.name "repo-bot"
+          git config --global user.email "repo-bot@users.noreply.github.com"
+
+      - name: Add peer remote (Repo B)
+        env:
+          PAT: ${{ secrets.REPO_PEER_PAT }}
+          PEER_REPO: ${{ secrets.PEER_REPO }}   # e.g. ORG/repo-b
+        run: |
+          git remote add peer "https://${PAT}@github.com/${PEER_REPO}.git"
+          git fetch peer --prune
+
+      - name: Create promotion branch in Repo B and cherry-pick
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          BR="promo/${SHA:0:12}-s-to-p"
+          # Start from Repo B main
+          git checkout -b "$BR" peer/main
+          # Fetch the exact commit from Repo A and cherry-pick
+          git fetch origin $SHA
+          # Cherry-pick with -x then add trailer
+          if ! git cherry-pick -x $SHA; then
+            echo "Cherry-pick conflict. Aborting to raise a PR with conflicts visible."
+            git cherry-pick --abort || true
+            # Fallback: create an empty commit to open a PR for manual resolution with context
+            git checkout -b "$BR" peer/main
+            git commit --allow-empty -m "Staged promotion placeholder for $SHA [promo s->p:${SHA}]"
+          else
+            # Append trailer to the cherry-pick commit message
+            git commit --amend -m "$(git log -1 --pretty=%B)[promo s->p:${SHA}]"
+          fi
+          git push peer "$BR"
+
+      - name: Open PR in Repo B
+        env:
+          GH_TOKEN: ${{ secrets.REPO_PEER_PAT }}
+          PEER_REPO: ${{ secrets.PEER_REPO }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh pr create \
+            --repo "$PEER_REPO" \
+            --head "promo/${SHA:0:12}-s-to-p" \
+            --base "main" \
+            --title "Stage→Prod promotion: ${SHA:0:12}" \
+            --body "Automated promotion of ${SHA}. Contains trailer [promo s->p:${SHA}]." \
+            --label "auto-promo,s->p"
