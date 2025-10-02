@@ -2,6 +2,8 @@ name: Promote to Prod (cherry-pick)
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - '.github/workflows/**'
   workflow_dispatch:
 
 jobs:
@@ -12,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: 
-          fetch-depth: 0
+          fetch-depth: 1
 
       - id: chk
         run: |
@@ -37,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: 
-          fetch-depth: 0
+          fetch-depth: 1
           token: ${{ secrets.REPO_PEER_PAT }}
 
       - name: Configure git
@@ -59,7 +61,12 @@ jobs:
         run: |
           BR="promo/${SHA:0:12}-s-to-p"
           # Start from Repo B main
-          git checkout -b "$BR" peer/main
+          if git show-ref --quiet refs/remotes/peer/"$BR"; then
+              echo "Branch $BR already exists on the remote. Skipping creation."
+          else
+              # Start from Repo B main and create the new branch if it doesn't exist
+              git checkout -b "$BR" peer/main
+          fi
           # Fetch the exact commit from Repo A and cherry-pick
           git fetch origin $SHA
           # Cherry-pick with -x then add trailer
@@ -68,7 +75,7 @@ jobs:
             git cherry-pick --abort || true
             # Fallback: create an empty commit to open a PR for manual resolution with context
             git checkout -b "$BR" peer/main
-            git commit --allow-empty -m "Staged promotion placeholder for $SHA [promo s->p:${SHA}]"
+            git commit --allow-empty -m "Staged promotion placeholder for $SHA [promo s->p:${SHA:0:12}]"
           else
             # Append trailer to the cherry-pick commit message
             git commit --amend -m "$(git log -1 --pretty=%B)[promo s->p:${SHA}]"
@@ -81,10 +88,10 @@ jobs:
           PEER_REPO: ${{ secrets.PEER_REPO }}
           SHA: ${{ github.sha }}
         run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
           gh pr create \
             --repo "$PEER_REPO" \
             --head "promo/${SHA:0:12}-s-to-p" \
             --base "main" \
             --title "Stage→Prod promotion: ${SHA:0:12}" \
-            --body "Automated promotion of ${SHA}. Contains trailer [promo s->p:${SHA}]." \
-            --label "auto-promo,s->p"
+            --body "Automated promotion of ${SHA}. Contains trailer [promo s->p:${SHA}]."
